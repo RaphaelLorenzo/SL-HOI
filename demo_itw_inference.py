@@ -189,25 +189,23 @@ def load_label_font(size: int = 18) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def background_font_for(font: ImageFont.ImageFont, scale: float = 1.35) -> ImageFont.ImageFont:
-    base_size = getattr(font, "size", 20)
-    return load_label_font(max(base_size + 2, int(round(base_size * scale))))
-
-
-def draw_label(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, font: ImageFont.ImageFont) -> None:
-    """Yellow caption with larger white text behind for readability on panos/crops."""
+def draw_label(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[float, float],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill_color: str = "#ffff00",
+    text_color: str = "#000000",
+) -> None:
+    """Text on a filled rectangle for readability on panos/crops."""
     x, y = xy
-    bg_font = background_font_for(font)
-    fg_bbox = draw.textbbox((0, 0), text, font=font)
-    bg_bbox = draw.textbbox((0, 0), text, font=bg_font)
-    fg_w = fg_bbox[2] - fg_bbox[0]
-    fg_h = fg_bbox[3] - fg_bbox[1]
-    bg_w = bg_bbox[2] - bg_bbox[0]
-    bg_h = bg_bbox[3] - bg_bbox[1]
-    bg_x = x + (fg_w - bg_w) / 2
-    bg_y = y + (fg_h - bg_h) / 2
-    draw.text((bg_x, bg_y), text, fill="#ffffff", font=bg_font)
-    draw.text((x, y), text, fill="#ffff00", font=font)
+    bbox = draw.textbbox((x, y), text, font=font)
+    pad = 4
+    draw.rectangle(
+        [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad],
+        fill=fill_color,
+    )
+    draw.text((x, y), text, fill=text_color, font=font)
 
 
 def main() -> None:

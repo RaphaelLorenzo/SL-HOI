@@ -5,8 +5,8 @@ Panorama demo: Ultralytics person detection + SL-HOI on data/itw/ssup_panos.
 For each YOLO person (height >= min height), SL-HOI runs on a fixed-size square crop
 (default 1024×1024) centered on that person—not on the full panorama. Horizontal edges
 wrap (equirectangular); vertical out-of-bounds regions are padded black. Boxes are mapped
-back to pano coordinates. Shows the top-1 HOI per person. Person crops are saved under
-``<output-dir>/crops/<pano_stem>/person_XXX.jpg``.
+back to pano coordinates. Up to ``--top-k-hoi-per-person`` HOI predictions per person (default 3).
+Person crops are saved under ``<output-dir>/crops/<pano_stem>/person_XXX.jpg``.
 
 Example:
   python demo_itw_inference_panos.py \\
@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="Max HOI candidates from SL-HOI before per-person assignment (HICO eval uses 100).",
+    )
+    parser.add_argument(
+        "--top-k-hoi-per-person",
+        type=int,
+        default=3,
+        help="Max HOI predictions assigned to each YOLO person (by score, subject IoU).",
     )
     parser.add_argument("--limit", type=int, default=0, help="Max number of panoramas (0 = all).")
     parser.add_argument("--show", action="store_true", help="Show each result with matplotlib.")
@@ -257,17 +263,50 @@ def draw_pano_rectangle_from_crop(
             draw.rectangle(xy, outline=outline, width=width)
 
 
+_PALE_PERSON_FILLS = (
+    "#ffd6e8",
+    "#cce4ff",
+    "#d8f5c8",
+    "#ffe8cc",
+    "#e4d4ff",
+    "#ccf0f0",
+    "#fff4c4",
+    "#f5d0e8",
+    "#c8e8ff",
+    "#e8f5c8",
+    "#ffd4c4",
+    "#d4d8ff",
+)
+
+
+def pale_person_colors(person_index: int) -> tuple[str, str]:
+    """Pale fill and dark text color, stable per person index."""
+    fill = _PALE_PERSON_FILLS[person_index % len(_PALE_PERSON_FILLS)]
+    return fill, "#222222"
+
+
 def draw_label_centered(
     draw: ImageDraw.ImageDraw,
     xy: tuple[float, float],
     text: str,
     font: ImageFont.ImageFont,
+    fill_color: str = "#ffff00",
+    text_color: str = "#000000",
 ) -> None:
     x, y = xy
     bbox = draw.textbbox((0, 0), text, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
-    draw_label(draw, (x - tw / 2, y - th / 2), text, font)
+    draw_label(draw, (x - tw / 2, y - th / 2), text, font, fill_color=fill_color, text_color=text_color)
+
+
+# HICO triplet verb index for generic "person and <object>" (no specific interaction).
+AND_VERB_ID = 57
+
+
+def is_and_verb_hoi(hoi: Dict[str, Any]) -> bool:
+    verb_label = (hoi.get("verb_label") or verb_label_from_hoi(hoi.get("label", ""), hoi.get("object_name", ""))).strip().lower()
+    return hoi.get("verb_id") == AND_VERB_ID or verb_label == "and"
 
 
 def verb_label_from_hoi(label: str, object_name: str) -> str:
@@ -280,88 +319,27 @@ def verb_label_from_hoi(label: str, object_name: str) -> str:
     return label
 
 
-def box_center_unwrapped_from_crop(
+def box_center_pano_from_crop(
     box_crop: List[float],
     origin_x: float,
     origin_y: float,
     pano_w: int,
     pano_h: int,
-) -> tuple[float, float, float, float]:
-    """Unwrapped (cx, cy) and display (cx % w, cy) for the object box center."""
+) -> tuple[float, float]:
     x1, y1, x2, y2 = (float(v) for v in box_crop)
     cx = (x1 + x2) * 0.5 + origin_x
-    cy = max(0.0, min(float(pano_h), (y1 + y2) * 0.5 + origin_y))
-    return cx, cy, cx % pano_w, cy
+    cy = (y1 + y2) * 0.5 + origin_y
+    return cx % pano_w, max(0.0, min(float(pano_h), cy))
 
 
-def shortest_unwrapped_x_pair(x0: float, x1: float, pano_w: int) -> tuple[float, float]:
-    """Unwrapped x endpoints for the shortest horizontal path on a cylindrical pano."""
-    w = float(pano_w)
-    best_dist = float("inf")
-    best = (x0, x1)
-    for shift_a in (-w, 0.0, w):
-        for shift_b in (-w, 0.0, w):
-            ua = x0 + shift_a
-            ub = x1 + shift_b
-            dist = abs(ub - ua)
-            if dist < best_dist:
-                best_dist = dist
-                best = (ua, ub)
-    return best
-
-
-def draw_wrapped_pano_line(
-    draw: ImageDraw.ImageDraw,
-    ux0: float,
-    uy0: float,
-    ux1: float,
-    uy1: float,
-    pano_w: int,
-    fill: str,
-    width: int,
-) -> None:
-    """Draw a straight line in unwrapped x; split into two segments at x = n * pano_w."""
-    w = float(pano_w)
-    lo, hi = min(ux0, ux1), max(ux0, ux1)
-    seams: List[float] = []
-    k = math.ceil(lo / w)
-    while k * w < hi:
-        sx = k * w
-        if lo < sx < hi:
-            seams.append(sx)
-        k += 1
-
-    points: List[tuple[float, float]] = [(ux0, uy0)]
-    dx = ux1 - ux0
-    for sx in seams:
-        if abs(dx) < 1e-9:
-            ty = uy0
-        else:
-            t = (sx - ux0) / dx
-            ty = uy0 + t * (uy1 - uy0)
-        points.append((sx, ty))
-    points.append((ux1, uy1))
-
-    for i in range(len(points) - 1):
-        ax, ay = points[i]
-        bx, by = points[i + 1]
-        draw.line([(ax % w, ay), (bx % w, by)], fill=fill, width=width)
+def pano_link_crosses_wrap(px: float, ox: float, pano_w: int) -> bool:
+    """True if the shorter cylindrical path between px and ox crosses the left/right seam."""
+    return abs(ox - px) > float(pano_w) / 2.0
 
 
 def person_box_center(person_xyxy: List[float]) -> tuple[float, float]:
     x1, y1, x2, y2 = person_xyxy
     return (x1 + x2) * 0.5, (y1 + y2) * 0.5
-
-
-def draw_line_endpoint(
-    draw: ImageDraw.ImageDraw,
-    cx: float,
-    cy: float,
-    radius: float,
-    fill: str,
-) -> None:
-    r = radius
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill, outline="#ffffff", width=2)
 
 
 def draw_hoi_link(
@@ -375,22 +353,45 @@ def draw_hoi_link(
     pano_w: int,
     pano_h: int,
     font: ImageFont.ImageFont,
-    line_color: str = "#ffcc00",
+    accent_color: str = "#ffcc00",
+    text_color: str = "#222222",
     line_width: int = 3,
 ) -> None:
     px, py = person_box_center(person_xyxy)
-    oux, oy, ox, _oy = box_center_unwrapped_from_crop(
-        obj_crop, origin_x, origin_y, pano_w, pano_h
+    ox, oy = box_center_pano_from_crop(obj_crop, origin_x, origin_y, pano_w, pano_h)
+    draw_label(
+        draw,
+        (ox, max(0.0, oy - 22)),
+        object_text,
+        font,
+        fill_color=accent_color,
+        text_color=text_color,
     )
-    ux0, ux1 = shortest_unwrapped_x_pair(px, oux, pano_w)
-    draw_wrapped_pano_line(draw, ux0, py, ux1, oy, pano_w, line_color, line_width)
+    if pano_link_crosses_wrap(px, ox, pano_w):
+        return
+
+    draw.line([(px, py), (ox, oy)], fill=accent_color, width=line_width)
     point_r = max(4.0, line_width * 2.5)
-    draw_line_endpoint(draw, px, py, point_r, line_color)
-    draw_line_endpoint(draw, ox, oy, point_r, line_color)
-    mid_ux = (ux0 + ux1) * 0.5
-    mid_uy = (py + oy) * 0.5
-    draw_label_centered(draw, (mid_ux % pano_w, mid_uy), verb_text, font)
-    draw_label(draw, (ox, max(0.0, oy - 22)), object_text, font)
+    draw.ellipse(
+        [px - point_r, py - point_r, px + point_r, py + point_r],
+        fill=accent_color,
+        outline="#ffffff",
+        width=2,
+    )
+    draw.ellipse(
+        [ox - point_r, oy - point_r, ox + point_r, oy + point_r],
+        fill=accent_color,
+        outline="#ffffff",
+        width=2,
+    )
+    draw_label_centered(
+        draw,
+        ((px + ox) * 0.5, (py + oy) * 0.5),
+        verb_text,
+        font,
+        fill_color=accent_color,
+        text_color=text_color,
+    )
 
 
 def pil_rectangle_xyxy(
@@ -491,22 +492,35 @@ def decode_slhoi_hois(
     return hois
 
 
-def top_hoi_for_person(person_xyxy: List[float], hois: List[Dict[str, Any]], min_iou: float) -> Optional[Dict[str, Any]]:
-    """Best-scoring HOI whose subject box overlaps the YOLO person (top-1 per person)."""
-    best: Optional[Dict[str, Any]] = None
-    best_iou = min_iou
-    for hoi in hois:
-        iou = box_iou_xyxy(person_xyxy, hoi["subject_box_xyxy"])
-        if iou < min_iou:
-            continue
-        if best is None or hoi["score"] > best["score"] or (hoi["score"] == best["score"] and iou > best_iou):
-            best = hoi
-            best_iou = iou
-    if best is not None:
-        return best
-    if not hois:
-        return None
-    return max(hois, key=lambda h: h["score"])
+def top_k_hois_for_person(
+    person_xyxy: List[float],
+    hois: List[Dict[str, Any]],
+    min_iou: float,
+    k: int,
+) -> List[Dict[str, Any]]:
+    """Up to k HOIs for this person: IoU-matched first, else top scores; unique category_id."""
+    if k <= 0 or not hois:
+        return []
+
+    def pick(ranked: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen_cat: set[int] = set()
+        for hoi in sorted(ranked, key=lambda h: h["score"], reverse=True):
+            cat = hoi["category_id"]
+            if cat in seen_cat:
+                continue
+            seen_cat.add(cat)
+            out.append(hoi)
+            if len(out) >= k:
+                break
+        return out
+
+    matched = [
+        h for h in hois if box_iou_xyxy(person_xyxy, h["subject_box_xyxy"]) >= min_iou
+    ]
+    if matched:
+        return pick(matched)
+    return pick(hois)
 
 
 def main() -> None:
@@ -642,7 +656,13 @@ def main() -> None:
                         }
                     )
                 total_hoi_candidates += len(pano_hois)
-                best_hoi = top_hoi_for_person(person["xyxy"], pano_hois, args.subject_iou_threshold)
+                hois_for_assign = [h for h in pano_hois if not is_and_verb_hoi(h)]
+                top_hois = top_k_hois_for_person(
+                    person["xyxy"],
+                    hois_for_assign,
+                    args.subject_iou_threshold,
+                    args.top_k_hoi_per_person,
+                )
                 person_results.append(
                     {
                         "person_index": person_idx,
@@ -652,50 +672,68 @@ def main() -> None:
                         "crop_origin_xy": [origin_x, origin_y],
                         "crop_size": args.crop_size,
                         "crop_image": str(crop_path.relative_to(args.output_dir)),
-                        "hoi": best_hoi,
+                        "hois": top_hois,
                     }
                 )
 
-            # --- Draw: person–object link, boxes (blue subject, red object) ---
+            # --- Draw: per-person pale accent (subject box, labels, link); red object box ---
             vis = pil.copy()
             draw = ImageDraw.Draw(vis)
             for pr in person_results:
                 px1, py1, px2, py2 = pr["person_box_xyxy"]
                 tag = f"P{pr['person_index']}"
-                hoi = pr["hoi"]
-                if hoi is None:
-                    draw_label(draw, (px1, max(0, py1 - 26)), f"{tag} | no HOI", font)
+                accent, label_text_color = pale_person_colors(pr["person_index"])
+                hois = pr["hois"]
+                if not hois:
+                    draw_label(
+                        draw,
+                        (px1, max(0, py1 - 26)),
+                        f"{tag} | no HOI",
+                        font,
+                        fill_color=accent,
+                        text_color=label_text_color,
+                    )
                     continue
 
                 crop_ox, crop_oy = pr["crop_origin_xy"]
-                sub_crop = hoi.get("subject_box_crop_xyxy", hoi["subject_box_xyxy"])
-                obj_crop = hoi.get("object_box_crop_xyxy", hoi["object_box_xyxy"])
+                sub_crop = hois[0].get("subject_box_crop_xyxy", hois[0]["subject_box_xyxy"])
                 draw_pano_rectangle_from_crop(
-                    draw, sub_crop, crop_ox, crop_oy, pano_w, pano_h, "#0066ff", 2
+                    draw, sub_crop, crop_ox, crop_oy, pano_w, pano_h, accent, 5
                 )
-                draw_pano_rectangle_from_crop(
-                    draw, obj_crop, crop_ox, crop_oy, pano_w, pano_h, "#ff3333", 3
-                )
-                verb_text = hoi.get("verb_label") or verb_label_from_hoi(hoi["label"], hoi["object_name"])
-                object_text = hoi["object_name"]
-                draw_hoi_link(
-                    draw,
-                    pr["person_box_xyxy"],
-                    obj_crop,
-                    crop_ox,
-                    crop_oy,
-                    verb_text,
-                    object_text,
-                    pano_w,
-                    pano_h,
-                    font,
-                )
+                scores_summary = ", ".join(f"{h['score']:.2f}" for h in hois[:3])
+                if len(hois) > 3:
+                    scores_summary += ", …"
                 draw_label(
                     draw,
                     (px1, max(0, py1 - 26)),
-                    f"{tag} | {hoi['score']:.2f}",
+                    f"{tag} | {len(hois)} HOI: {scores_summary}",
                     font,
+                    fill_color=accent,
+                    text_color=label_text_color,
                 )
+                for rank, hoi in enumerate(hois):
+                    obj_crop = hoi.get("object_box_crop_xyxy", hoi["object_box_xyxy"])
+                    verb_text = hoi.get("verb_label") or verb_label_from_hoi(hoi["label"], hoi["object_name"])
+                    if is_and_verb_hoi(hoi):
+                        continue
+                    draw_pano_rectangle_from_crop(
+                        draw, obj_crop, crop_ox, crop_oy, pano_w, pano_h, "#ff3333", 3
+                    )
+                    object_text = hoi["object_name"]
+                    draw_hoi_link(
+                        draw,
+                        pr["person_box_xyxy"],
+                        obj_crop,
+                        crop_ox,
+                        crop_oy,
+                        f"{rank + 1}. {verb_text}",
+                        object_text,
+                        pano_w,
+                        pano_h,
+                        font,
+                        accent_color=accent,
+                        text_color=label_text_color,
+                    )
 
             out_path = vis_dir / pano_path.name
             vis.save(out_path, quality=92)
@@ -712,11 +750,11 @@ def main() -> None:
             all_results.append(record)
 
             logger.info(
-                "%s: %d persons (h>=%.0f), %d with top-1 HOI -> %s",
+                "%s: %d persons (h>=%.0f), %d with >=1 HOI -> %s",
                 pano_path.name,
                 len(persons),
                 args.min_person_height,
-                sum(1 for p in person_results if p["hoi"] is not None),
+                sum(1 for p in person_results if p["hois"]),
                 out_path,
             )
 
@@ -740,6 +778,7 @@ def main() -> None:
                 "crop_size": args.crop_size,
                 "subject_iou_threshold": args.subject_iou_threshold,
                 "score_threshold": args.score_threshold,
+                "top_k_hoi_per_person": args.top_k_hoi_per_person,
                 "images": all_results,
             },
             f,
