@@ -179,12 +179,21 @@ class HOIDetector(nn.Module):
         return src, mask, pos[-1], tokens
     
     def forward(self, samples: NestedTensor):
+        
+        # samples have diverse sizes (B, C, H, W) with torch.Size([1, 3, 800, 1066]) or torch.Size([1, 3, 837, 800]) for example
+        
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         
         src, mask, pos, tokens = self.get_backbone_features(samples)
+        
+        # src shape:  torch.Size([1, 8192, 50, 74])
+        # mask shape:  torch.Size([1, 50, 74])
+        # pos shape:  torch.Size([1, 256, 50, 74])
+        # tokens shape:  torch.Size([1, 955, 1024])
         # for object detection, we do not need gradients for semantics
         semantics = self.get_semantics(tokens)
+        # semantics shape:  torch.Size([1, 952, 1024])
 
         if self.training:
             src = src.clone().detach().requires_grad_(True)

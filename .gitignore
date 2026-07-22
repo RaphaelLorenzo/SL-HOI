@@ -39,3 +39,11 @@ data/
 SL-HOI-weights/params/
 SL-HOI-weights/pretrained/
 NOTES.md
+
+output/
+*.mp4
+*.jpg
+*.jpeg
+*.png
+predictions.json
+weights/
