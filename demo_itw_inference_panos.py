@@ -3,8 +3,10 @@
 Panorama demo: Ultralytics person detection + SL-HOI on data/itw/ssup_panos.
 
 For each YOLO person (height >= min height), SL-HOI runs on a fixed-size square crop
-(default 1024×1024) centered on that person—not on the full panorama—then boxes are mapped
-back to pano coordinates. Shows the top-1 HOI per person.
+(default 1024×1024) centered on that person—not on the full panorama. Horizontal edges
+wrap (equirectangular); vertical out-of-bounds regions are padded black. Boxes are mapped
+back to pano coordinates. Shows the top-1 HOI per person. Person crops are saved under
+``<output-dir>/crops/<pano_stem>/person_XXX.jpg``.
 
 Example:
   python demo_itw_inference_panos.py \\
@@ -17,13 +19,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
 
 from datasets.hico import make_hico_transforms
@@ -129,9 +132,12 @@ def centered_square_crop(
 ) -> tuple[Image.Image, float, float]:
     """
     Extract a size×size crop centered on the person box center.
-    Pads with black when the window extends past image borders.
-    Returns (crop, origin_x, origin_y): full-image coords of the crop's top-left corner
-    (crop pixel (0,0) ↔ full image (origin_x, origin_y)).
+
+    Equirectangular panos: wrap horizontally at image width; pad vertically with black
+    when the window extends past the top or bottom.
+
+    Returns (crop, origin_x, origin_y): unwrapped top-left of the crop window
+    (crop pixel (dx, dy) samples pano x = origin_x + dx (mod width), y = origin_y + dy).
     """
     w, h = image.size
     x1, y1, x2, y2 = person_xyxy
@@ -141,20 +147,213 @@ def centered_square_crop(
     origin_y = cy - size * 0.5
 
     crop = Image.new("RGB", (size, size), (0, 0, 0))
-    src_left = max(0, int(origin_x))
-    src_top = max(0, int(origin_y))
-    src_right = min(w, int(origin_x + size))
-    src_bottom = min(h, int(origin_y + size))
-    if src_right > src_left and src_bottom > src_top:
-        patch = image.crop((src_left, src_top, src_right, src_bottom))
-        dst_left = int(round(src_left - origin_x))
-        dst_top = int(round(src_top - origin_y))
-        crop.paste(patch, (dst_left, dst_top))
+    for dy in range(size):
+        sy = int(math.floor(origin_y + dy))
+        if sy < 0 or sy >= h:
+            continue
+        dst = 0
+        u = origin_x
+        while dst < size:
+            img_x = int(math.floor(u)) % w
+            run = min(size - dst, w - img_x)
+            strip = image.crop((img_x, sy, img_x + run, sy + 1))
+            crop.paste(strip, (dst, dy))
+            dst += run
+            u += run
     return crop, origin_x, origin_y
 
 
-def offset_box_xyxy(box: List[float], origin_x: float, origin_y: float) -> List[float]:
-    return [box[0] + origin_x, box[1] + origin_y, box[2] + origin_x, box[3] + origin_y]
+def offset_box_xyxy(
+    box: List[float],
+    origin_x: float,
+    origin_y: float,
+    pano_w: int,
+    pano_h: int,
+) -> List[float]:
+    """Map crop-space xyxy to pano pixels (wrap x, clamp y to image)."""
+    x1, y1, x2, y2 = box
+    ux1 = (float(x1) + origin_x) % pano_w
+    ux2 = (float(x2) + origin_x) % pano_w
+    uy1 = float(y1) + origin_y
+    uy2 = float(y2) + origin_y
+    if uy1 > uy2:
+        uy1, uy2 = uy2, uy1
+    uy1 = max(0.0, min(float(pano_h), uy1))
+    uy2 = max(0.0, min(float(pano_h), uy2))
+    return [ux1, uy1, ux2, uy2]
+
+
+def pano_y_range_from_crop_box(
+    box: List[float],
+    origin_y: float,
+    pano_h: int,
+) -> Optional[tuple[float, float]]:
+    _, y1, _, y2 = (float(v) for v in box)
+    if y1 > y2:
+        y1, y2 = y2, y1
+    y1 = max(0.0, min(float(pano_h), y1 + origin_y))
+    y2 = max(0.0, min(float(pano_h), y2 + origin_y))
+    if y2 <= y1:
+        return None
+    return y1, y2
+
+
+def pano_x_segments_from_crop_box(
+    box: List[float],
+    origin_x: float,
+    pano_w: int,
+) -> List[tuple[float, float]]:
+    """
+    Map crop x extent to one or two pano x intervals when the unwrapped span crosses width.
+    """
+    x1, _, x2, _ = (float(v) for v in box)
+    if x1 > x2:
+        x1, x2 = x2, x1
+    left = x1 + origin_x
+    right = x2 + origin_x
+    if right <= left:
+        return []
+
+    w = float(pano_w)
+    segments: List[tuple[float, float]] = []
+    pos = left
+    while pos < right:
+        x_start = pos % w
+        period_end = (math.floor(pos / w) + 1) * w
+        end = min(right, period_end)
+        span = end - pos
+        x_end = x_start + span
+        if x_end <= w:
+            if x_end > x_start:
+                segments.append((x_start, x_end))
+        else:
+            if w > x_start:
+                segments.append((x_start, w))
+            tail = x_end - w
+            if tail > 0:
+                segments.append((0.0, tail))
+        pos = end
+    return segments
+
+
+def draw_pano_rectangle_from_crop(
+    draw: ImageDraw.ImageDraw,
+    box_crop: List[float],
+    origin_x: float,
+    origin_y: float,
+    pano_w: int,
+    pano_h: int,
+    outline: str,
+    width: int,
+) -> None:
+    """Draw a crop-space box on the equirectangular pano (split at horizontal wrap)."""
+    y_range = pano_y_range_from_crop_box(box_crop, origin_y, pano_h)
+    if y_range is None:
+        return
+    y0, y1 = y_range
+    for x0, x2 in pano_x_segments_from_crop_box(box_crop, origin_x, pano_w):
+        xy = pil_rectangle_xyxy([x0, y0, x2, y1], pano_w, pano_h)
+        if xy is not None:
+            draw.rectangle(xy, outline=outline, width=width)
+
+
+def draw_label_centered(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[float, float],
+    text: str,
+    font: ImageFont.ImageFont,
+) -> None:
+    x, y = xy
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw_label(draw, (x - tw / 2, y - th / 2), text, font)
+
+
+def verb_label_from_hoi(label: str, object_name: str) -> str:
+    """Interaction text minus trailing object phrase (e.g. 'riding a bicycle' -> 'riding')."""
+    for suffix in (f"a {object_name}", f"an {object_name}", object_name):
+        if label.endswith(suffix):
+            verb = label[: -len(suffix)].strip()
+            if verb:
+                return verb
+    return label
+
+
+def box_center_pano_from_crop(
+    box_crop: List[float],
+    origin_x: float,
+    origin_y: float,
+    pano_w: int,
+    pano_h: int,
+) -> tuple[float, float]:
+    x1, y1, x2, y2 = (float(v) for v in box_crop)
+    cx = (x1 + x2) * 0.5 + origin_x
+    cy = (y1 + y2) * 0.5 + origin_y
+    return cx % pano_w, max(0.0, min(float(pano_h), cy))
+
+
+def person_box_center(person_xyxy: List[float]) -> tuple[float, float]:
+    x1, y1, x2, y2 = person_xyxy
+    return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+
+def draw_line_endpoint(
+    draw: ImageDraw.ImageDraw,
+    cx: float,
+    cy: float,
+    radius: float,
+    fill: str,
+) -> None:
+    r = radius
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=fill, outline="#ffffff", width=2)
+
+
+def draw_hoi_link(
+    draw: ImageDraw.ImageDraw,
+    person_xyxy: List[float],
+    obj_crop: List[float],
+    origin_x: float,
+    origin_y: float,
+    verb_text: str,
+    object_text: str,
+    pano_w: int,
+    pano_h: int,
+    font: ImageFont.ImageFont,
+    line_color: str = "#ffcc00",
+    line_width: int = 3,
+) -> None:
+    px, py = person_box_center(person_xyxy)
+    ox, oy = box_center_pano_from_crop(obj_crop, origin_x, origin_y, pano_w, pano_h)
+    draw.line([(px, py), (ox, oy)], fill=line_color, width=line_width)
+    point_r = max(4.0, line_width * 2.5)
+    draw_line_endpoint(draw, px, py, point_r, line_color)
+    draw_line_endpoint(draw, ox, oy, point_r, line_color)
+    draw_label_centered(draw, ((px + ox) * 0.5, (py + oy) * 0.5), verb_text, font)
+    draw_label(draw, (ox, max(0.0, oy - 22)), object_text, font)
+
+
+def pil_rectangle_xyxy(
+    box: List[float],
+    pano_w: int,
+    pano_h: int,
+) -> Optional[List[float]]:
+    """
+    xyxy suitable for ImageDraw.rectangle (x0 <= x1, y0 <= y1, inside image).
+    Returns None if the box is degenerate after normalization.
+    """
+    x1, y1, x2, y2 = (float(v) for v in box)
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+    x1 = max(0.0, min(float(pano_w), x1))
+    x2 = max(0.0, min(float(pano_w), x2))
+    y1 = max(0.0, min(float(pano_h), y1))
+    y2 = max(0.0, min(float(pano_h), y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
 
 
 def decode_slhoi_hois(
@@ -215,14 +414,16 @@ def decode_slhoi_hois(
         verb_obj = hoi_triplet_keys[cat_id]
         label_text = hico_text_label[verb_obj]
         label = label_text.replace("a photo of a person ", "").replace("a photo of ", "")
+        object_name = obj_name_by_id.get(int(verb_obj[1]), f"object_{verb_obj[1]}")
         hois.append(
             {
                 "score": float(pred["score"]),
                 "category_id": cat_id,
                 "label": label,
+                "verb_label": verb_label_from_hoi(label, object_name),
+                "object_name": object_name,
                 "verb_id": int(verb_obj[0]),
                 "object_id": int(verb_obj[1]),
-                "object_name": obj_name_by_id.get(int(verb_obj[1]), f"object_{verb_obj[1]}"),
                 "subject_box_xyxy": [float(x) for x in bboxes[pred["subject_id"]]["bbox"]],
                 "object_box_xyxy": [float(x) for x in bboxes[pred["object_id"]]["bbox"]],
             }
@@ -260,6 +461,8 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     vis_dir = args.output_dir / "visualizations"
     vis_dir.mkdir(parents=True, exist_ok=True)
+    crops_root = args.output_dir / "crops"
+    crops_root.mkdir(parents=True, exist_ok=True)
 
     cfg = OmegaConf.merge(OmegaConf.load(args.default_config), OmegaConf.load(args.config))
     cfg.RUNTIME.DEVICE = args.device
@@ -305,6 +508,7 @@ def main() -> None:
     with torch.inference_mode():
         for pano_path in pano_paths:
             pil = Image.open(pano_path).convert("RGB")
+            pano_w, pano_h = pil.size
 
             # --- YOLO: person boxes (COCO class 0), filter by height ---
             yolo_out = yolo.predict(
@@ -333,6 +537,9 @@ def main() -> None:
                     )
             persons.sort(key=lambda p: p["confidence"], reverse=True)
 
+            pano_crop_dir = crops_root / pano_path.stem
+            pano_crop_dir.mkdir(parents=True, exist_ok=True)
+
             # --- SL-HOI on a person-centered crop per detection ---
             person_results: List[Dict[str, Any]] = []
             total_hoi_candidates = 0
@@ -340,6 +547,10 @@ def main() -> None:
                 crop_pil, origin_x, origin_y = centered_square_crop(
                     pil, person["xyxy"], args.crop_size
                 )
+                crop_filename = f"person_{person_idx:03d}.jpg"
+                crop_path = pano_crop_dir / crop_filename
+                crop_pil.save(crop_path, quality=92)
+
                 crop_hois = decode_slhoi_hois(
                     crop_pil,
                     model,
@@ -355,11 +566,19 @@ def main() -> None:
                 )
                 pano_hois: List[Dict[str, Any]] = []
                 for hoi in crop_hois:
+                    sub_crop = [float(x) for x in hoi["subject_box_xyxy"]]
+                    obj_crop = [float(x) for x in hoi["object_box_xyxy"]]
                     pano_hois.append(
                         {
                             **hoi,
-                            "subject_box_xyxy": offset_box_xyxy(hoi["subject_box_xyxy"], origin_x, origin_y),
-                            "object_box_xyxy": offset_box_xyxy(hoi["object_box_xyxy"], origin_x, origin_y),
+                            "subject_box_crop_xyxy": sub_crop,
+                            "object_box_crop_xyxy": obj_crop,
+                            "subject_box_xyxy": offset_box_xyxy(
+                                sub_crop, origin_x, origin_y, pano_w, pano_h
+                            ),
+                            "object_box_xyxy": offset_box_xyxy(
+                                obj_crop, origin_x, origin_y, pano_w, pano_h
+                            ),
                         }
                     )
                 total_hoi_candidates += len(pano_hois)
@@ -372,29 +591,51 @@ def main() -> None:
                         "person_height": person["height"],
                         "crop_origin_xy": [origin_x, origin_y],
                         "crop_size": args.crop_size,
+                        "crop_image": str(crop_path.relative_to(args.output_dir)),
                         "hoi": best_hoi,
                     }
                 )
 
-            # --- Draw: green = YOLO person, red = object, blue = SL-HOI subject (if assigned) ---
+            # --- Draw: person–object link, boxes (blue subject, red object) ---
             vis = pil.copy()
             draw = ImageDraw.Draw(vis)
             for pr in person_results:
                 px1, py1, px2, py2 = pr["person_box_xyxy"]
-                # draw.rectangle([px1, py1, px2, py2], outline="#00cc00", width=3)
-                tag = f"P{pr['person_index']} det {pr['person_confidence']:.2f}"
+                tag = f"P{pr['person_index']}"
                 hoi = pr["hoi"]
-                label_y = max(0, py1 - 26)
                 if hoi is None:
-                    draw_label(draw, (px1, label_y), f"{tag} | no HOI", font)
+                    draw_label(draw, (px1, max(0, py1 - 26)), f"{tag} | no HOI", font)
                     continue
 
-                sx1, sy1, sx2, sy2 = hoi["subject_box_xyxy"]
-                ox1, oy1, ox2, oy2 = hoi["object_box_xyxy"]
-                draw.rectangle([sx1, sy1, sx2, sy2], outline="#0066ff", width=2)
-                draw.rectangle([ox1, oy1, ox2, oy2], outline="#ff3333", width=3)
-                caption = f"{tag} | {hoi['label']} ({hoi['score']:.2f})"
-                draw_label(draw, (px1, label_y), caption, font)
+                crop_ox, crop_oy = pr["crop_origin_xy"]
+                sub_crop = hoi.get("subject_box_crop_xyxy", hoi["subject_box_xyxy"])
+                obj_crop = hoi.get("object_box_crop_xyxy", hoi["object_box_xyxy"])
+                draw_pano_rectangle_from_crop(
+                    draw, sub_crop, crop_ox, crop_oy, pano_w, pano_h, "#0066ff", 2
+                )
+                draw_pano_rectangle_from_crop(
+                    draw, obj_crop, crop_ox, crop_oy, pano_w, pano_h, "#ff3333", 3
+                )
+                verb_text = hoi.get("verb_label") or verb_label_from_hoi(hoi["label"], hoi["object_name"])
+                object_text = hoi["object_name"]
+                draw_hoi_link(
+                    draw,
+                    pr["person_box_xyxy"],
+                    obj_crop,
+                    crop_ox,
+                    crop_oy,
+                    verb_text,
+                    object_text,
+                    pano_w,
+                    pano_h,
+                    font,
+                )
+                draw_label(
+                    draw,
+                    (px1, max(0, py1 - 26)),
+                    f"{tag} | {hoi['score']:.2f}",
+                    font,
+                )
 
             out_path = vis_dir / pano_path.name
             vis.save(out_path, quality=92)
