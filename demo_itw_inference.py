@@ -32,9 +32,9 @@ from util.topk import top_k
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_CHECKPOINT = REPO_ROOT / "SL-HOI-weights/pretrained/hico/pytorch_model.bin"
-DEFAULT_CLASSIFIER_TRAIN = REPO_ROOT / "SL-HOI-weights/params/hico/classifier_default.pt"
-DEFAULT_CLASSIFIER_EVAL = REPO_ROOT / "SL-HOI-weights/params/hico/classifier_eval.pt"
+DEFAULT_CHECKPOINT = REPO_ROOT / "weights/SL-HOI-weights/pretrained/hico/pytorch_model.bin"
+DEFAULT_CLASSIFIER_TRAIN = REPO_ROOT / "weights/SL-HOI-weights/params/hico/classifier_default.pt"
+DEFAULT_CLASSIFIER_EVAL = REPO_ROOT / "weights/SL-HOI-weights/params/hico/classifier_eval.pt"
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,7 +204,7 @@ def main() -> None:
     if not args.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.classifier_train.is_file() or not args.classifier_eval.is_file():
-        raise FileNotFoundError("Classifier weights missing under SL-HOI-weights/params/hico/")
+        raise FileNotFoundError("Classifier weights missing under weights/SL-HOI-weights/params/hico/")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     hoi_vis_dir = args.output_dir / "hoi_visualizations"

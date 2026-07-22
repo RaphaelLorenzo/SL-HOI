@@ -255,7 +255,7 @@ def main() -> None:
     if not args.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.classifier_train.is_file() or not args.classifier_eval.is_file():
-        raise FileNotFoundError("Classifier weights missing under SL-HOI-weights/params/hico/")
+        raise FileNotFoundError("Classifier weights missing under weights/SL-HOI-weights/params/hico/")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     vis_dir = args.output_dir / "visualizations"
