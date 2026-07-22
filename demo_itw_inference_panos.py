@@ -280,17 +280,72 @@ def verb_label_from_hoi(label: str, object_name: str) -> str:
     return label
 
 
-def box_center_pano_from_crop(
+def box_center_unwrapped_from_crop(
     box_crop: List[float],
     origin_x: float,
     origin_y: float,
     pano_w: int,
     pano_h: int,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
+    """Unwrapped (cx, cy) and display (cx % w, cy) for the object box center."""
     x1, y1, x2, y2 = (float(v) for v in box_crop)
     cx = (x1 + x2) * 0.5 + origin_x
-    cy = (y1 + y2) * 0.5 + origin_y
-    return cx % pano_w, max(0.0, min(float(pano_h), cy))
+    cy = max(0.0, min(float(pano_h), (y1 + y2) * 0.5 + origin_y))
+    return cx, cy, cx % pano_w, cy
+
+
+def shortest_unwrapped_x_pair(x0: float, x1: float, pano_w: int) -> tuple[float, float]:
+    """Unwrapped x endpoints for the shortest horizontal path on a cylindrical pano."""
+    w = float(pano_w)
+    best_dist = float("inf")
+    best = (x0, x1)
+    for shift_a in (-w, 0.0, w):
+        for shift_b in (-w, 0.0, w):
+            ua = x0 + shift_a
+            ub = x1 + shift_b
+            dist = abs(ub - ua)
+            if dist < best_dist:
+                best_dist = dist
+                best = (ua, ub)
+    return best
+
+
+def draw_wrapped_pano_line(
+    draw: ImageDraw.ImageDraw,
+    ux0: float,
+    uy0: float,
+    ux1: float,
+    uy1: float,
+    pano_w: int,
+    fill: str,
+    width: int,
+) -> None:
+    """Draw a straight line in unwrapped x; split into two segments at x = n * pano_w."""
+    w = float(pano_w)
+    lo, hi = min(ux0, ux1), max(ux0, ux1)
+    seams: List[float] = []
+    k = math.ceil(lo / w)
+    while k * w < hi:
+        sx = k * w
+        if lo < sx < hi:
+            seams.append(sx)
+        k += 1
+
+    points: List[tuple[float, float]] = [(ux0, uy0)]
+    dx = ux1 - ux0
+    for sx in seams:
+        if abs(dx) < 1e-9:
+            ty = uy0
+        else:
+            t = (sx - ux0) / dx
+            ty = uy0 + t * (uy1 - uy0)
+        points.append((sx, ty))
+    points.append((ux1, uy1))
+
+    for i in range(len(points) - 1):
+        ax, ay = points[i]
+        bx, by = points[i + 1]
+        draw.line([(ax % w, ay), (bx % w, by)], fill=fill, width=width)
 
 
 def person_box_center(person_xyxy: List[float]) -> tuple[float, float]:
@@ -324,12 +379,17 @@ def draw_hoi_link(
     line_width: int = 3,
 ) -> None:
     px, py = person_box_center(person_xyxy)
-    ox, oy = box_center_pano_from_crop(obj_crop, origin_x, origin_y, pano_w, pano_h)
-    draw.line([(px, py), (ox, oy)], fill=line_color, width=line_width)
+    oux, oy, ox, _oy = box_center_unwrapped_from_crop(
+        obj_crop, origin_x, origin_y, pano_w, pano_h
+    )
+    ux0, ux1 = shortest_unwrapped_x_pair(px, oux, pano_w)
+    draw_wrapped_pano_line(draw, ux0, py, ux1, oy, pano_w, line_color, line_width)
     point_r = max(4.0, line_width * 2.5)
     draw_line_endpoint(draw, px, py, point_r, line_color)
     draw_line_endpoint(draw, ox, oy, point_r, line_color)
-    draw_label_centered(draw, ((px + ox) * 0.5, (py + oy) * 0.5), verb_text, font)
+    mid_ux = (ux0 + ux1) * 0.5
+    mid_uy = (py + oy) * 0.5
+    draw_label_centered(draw, (mid_ux % pano_w, mid_uy), verb_text, font)
     draw_label(draw, (ox, max(0.0, oy - 22)), object_text, font)
 
 
