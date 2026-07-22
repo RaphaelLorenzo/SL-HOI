@@ -34,3 +34,8 @@ exps/
 # Temporary files
 *.tmp
 *.temp
+
+data/
+SL-HOI-weights/params/
+SL-HOI-weights/pretrained/
+NOTES.md
